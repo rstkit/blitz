@@ -1,4 +1,5 @@
-use blitz_dom::BaseDocument;
+use anyrender::PaintScene;
+use blitz_dom::{BaseDocument, NodeId};
 use kurbo::{Affine, Rect, Vec2};
 
 use crate::color::Color;
@@ -6,11 +7,32 @@ use crate::color::Color;
 /// Renders a layout debugging overlay which visualises the content size, padding and border
 /// of the node with a transparent overlay.
 pub(crate) fn render_debug_overlay(
-    scene: &mut impl anyrender::Scene,
+    scene: &mut impl PaintScene,
     dom: &BaseDocument,
-    node_id: usize,
+    node_id: NodeId,
     scale: f64,
+    initial_x: f64,
+    initial_y: f64,
 ) {
+    // Non-atomic inline elements have no layout box of their own: they are laid
+    // out as style spans within an inline root's text layout and may fragment
+    // across multiple line boxes. Highlight each fragment's content box.
+    if let Some(rects) = dom.as_ref().inline_fragment_rects(node_id) {
+        let fill_color = Color::from_rgba8(66, 144, 245, 128); // blue
+        for r in rects {
+            let rect = Rect::new(0.0, 0.0, r.width * scale, r.height * scale);
+            let translation = Vec2::new(r.x * scale + initial_x, r.y * scale + initial_y);
+            scene.fill(
+                peniko::Fill::NonZero,
+                Affine::translate(translation),
+                fill_color,
+                None,
+                &rect,
+            );
+        }
+        return;
+    }
+
     let viewport_scroll = dom.as_ref().viewport_scroll();
     let mut node = &dom.as_ref().tree()[node_id];
 
@@ -20,7 +42,7 @@ pub(crate) fn render_debug_overlay(
         padding,
         margin,
         ..
-    } = node.final_layout;
+    } = *node.final_layout();
     let taffy::Size { width, height } = size;
 
     let padding_border = padding + border;
@@ -32,23 +54,24 @@ pub(crate) fn render_debug_overlay(
     let content_width = width - padding_border.left - padding_border.right;
     let content_height = height - padding_border.top - padding_border.bottom;
 
-    let taffy::Point { x, y } = node.final_layout.location;
+    let taffy::Point { x, y } = node.final_layout().location;
 
     let mut abs_x = x;
     let mut abs_y = y;
     while let Some(parent_id) = node.layout_parent.get() {
         node = &dom.as_ref().tree()[parent_id];
-        let taffy::Point { x, y } = node.final_layout.location;
-        abs_x += x;
-        abs_y += y;
+        let taffy::Point { x, y } = node.final_layout().location;
+        abs_x += x - node.scroll_offset().x as f32;
+        abs_y += y - node.scroll_offset().y as f32;
     }
 
     abs_x -= viewport_scroll.x as f32;
     abs_y -= viewport_scroll.y as f32;
 
-    // Hack: scale factor
-    let abs_x = f64::from(abs_x) * scale;
-    let abs_y = f64::from(abs_y) * scale;
+    // Note: initial_x/initial_y are already in physical (scaled) pixels so they must be added after scaling
+    // the other values
+    let abs_x = f64::from(abs_x) * scale + initial_x;
+    let abs_y = f64::from(abs_y) * scale + initial_y;
     let width = f64::from(width) * scale;
     let height = f64::from(height) * scale;
     let content_width = f64::from(content_width) * scale;
@@ -96,7 +119,7 @@ pub(crate) fn render_debug_overlay(
 }
 
 fn draw_cutout_rect(
-    scene: &mut impl anyrender::Scene,
+    scene: &mut impl PaintScene,
     base_translation: Vec2,
     size: Vec2,
     edge_widths: taffy::Rect<f64>,

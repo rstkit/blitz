@@ -1,10 +1,12 @@
-use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, Method};
+//! Abstractions allow embedders to handle link clicks and form submissions
+
+use http::{HeaderMap, Method};
 use url::Url;
 
-use crate::net::Request;
+use crate::net::{Body, Request};
 
-/// A provider to enable a document to bubble up navigation events (e.g. clicking a link)
+/// An abstraction to allow embedders to hook into "navigation events" such as clicking a link
+/// or submitting a form.
 pub trait NavigationProvider: Send + Sync + 'static {
     fn navigate_to(&self, options: NavigationOptions);
 }
@@ -23,49 +25,44 @@ pub struct NavigationOptions {
     /// The URL to navigate to
     pub url: Url,
 
-    pub content_type: String,
+    pub content_type: Option<String>,
 
     /// Source document for the navigation
     pub source_document: usize,
 
-    pub document_resource: Option<Bytes>,
+    pub method: Method,
+
+    pub document_resource: Body,
 }
 
 impl NavigationOptions {
-    pub fn new(url: Url, content_type: String, source_document: usize) -> Self {
+    pub fn new(url: Url, content_type: Option<String>, source_document: usize) -> Self {
         Self {
             url,
             content_type,
             source_document,
-            document_resource: None,
+            method: Method::GET,
+            document_resource: Body::Empty,
         }
     }
-    pub fn set_document_resource(mut self, document_resource: Option<Bytes>) -> Self {
+    pub fn set_document_resource(mut self, document_resource: Body) -> Self {
         self.document_resource = document_resource;
         self
     }
 
-    pub fn into_request(self) -> Request {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-type",
-            HeaderValue::from_str(&self.content_type).unwrap(),
-        );
+    pub fn set_method(mut self, method: Method) -> Self {
+        self.method = method;
+        self
+    }
 
-        if let Some(document_resource) = self.document_resource {
-            Request {
-                url: self.url,
-                method: Method::POST,
-                headers,
-                body: document_resource,
-            }
-        } else {
-            Request {
-                url: self.url,
-                method: Method::GET,
-                headers,
-                body: Bytes::new(),
-            }
+    pub fn into_request(self) -> Request {
+        Request {
+            url: self.url,
+            method: self.method,
+            content_type: self.content_type,
+            headers: HeaderMap::new(),
+            body: self.document_resource,
+            signal: None,
         }
     }
 }

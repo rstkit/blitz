@@ -1,7 +1,7 @@
 use crate::color::{Color, ToColorColor};
 use color::DynamicColor;
 use kurbo::{self, Affine, Point, Rect, Vec2};
-use peniko::{self, Gradient};
+use peniko::{self, ColorStop, Gradient, LinearGradientPosition, SweepGradientPosition};
 use style::color::AbsoluteColor;
 use style::{
     OwnedSlice,
@@ -149,10 +149,10 @@ fn linear_gradient(
         repeating,
     );
     if repeating && gradient.stops.len() > 1 {
-        gradient.kind = peniko::GradientKind::Linear {
+        gradient.kind = peniko::GradientKind::Linear(LinearGradientPosition {
             start: start + (end - start) * first_offset as f64,
             end: end + (start - end) * (1.0 - last_offset) as f64,
-        };
+        });
     }
 
     (gradient, None)
@@ -290,11 +290,11 @@ fn conic_gradient(
         repeating,
     );
     if repeating && gradient.stops.len() >= 2 {
-        gradient.kind = peniko::GradientKind::Sweep {
+        gradient.kind = peniko::GradientKind::Sweep(SweepGradientPosition {
             center: Point::new(0.0, 0.0),
             start_angle: std::f32::consts::PI * 2.0 * first_offset,
             end_angle: std::f32::consts::PI * 2.0 * last_offset,
-        };
+        });
     }
 
     let gradient_transform = Some(
@@ -322,7 +322,7 @@ fn resolve_length_color_stops(
         |gradient_length: CSSPixelLength, position: &LengthPercentage| -> Option<f32> {
             position
                 .to_percentage_of(gradient_length)
-                .map(|percentage| percentage.to_percentage())
+                .map(|percentage| percentage.to_percentage().unwrap_or(0.0))
         },
     )
 }
@@ -458,6 +458,17 @@ fn resolve_color_stops<T>(
         }
         (first_offset, last_offset)
     } else {
+        // Ensure that the gradient ends at offset 1.0
+        if gradient.stops.len() > 1 {
+            let last_stop = &gradient.stops.last().unwrap();
+            if last_stop.offset < 1.0 {
+                let last_stop = ColorStop {
+                    offset: 1.0,
+                    ..(**last_stop)
+                };
+                gradient.stops.push(last_stop);
+            }
+        }
         (0.0, 1.0)
     }
 }
@@ -481,7 +492,9 @@ fn resolve_angle_color_stops(
                 AngleOrPercentage::Angle(angle) => {
                     Some(angle.radians() / (std::f64::consts::PI * 2.0) as f32)
                 }
-                AngleOrPercentage::Percentage(percentage) => Some(percentage.to_percentage()),
+                AngleOrPercentage::Percentage(percentage) => {
+                    Some(percentage.to_percentage().unwrap_or(0.0))
+                }
             }
         },
     )

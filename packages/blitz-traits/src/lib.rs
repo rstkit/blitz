@@ -1,14 +1,12 @@
+//! Types and traits to enable interoperability between the other Blitz crates without
+//! circular or unnecessary dependencies.
+
+pub mod devtools;
 pub mod events;
 pub mod navigation;
 pub mod net;
+pub mod node_id;
 pub mod shell;
 
-mod devtools;
-mod viewport;
-
-pub use devtools::Devtools;
-pub use events::{
-    BlitzImeEvent, BlitzKeyEvent, BlitzMouseButtonEvent, DomEvent, DomEventData, EventState,
-    HitResult, KeyState, MouseEventButton, MouseEventButtons,
-};
-pub use viewport::{ColorScheme, Viewport};
+pub use node_id::NodeId;
+pub use smol_str::SmolStr;

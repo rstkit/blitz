@@ -1,4 +1,6 @@
 use blitz_dom::Node;
+use log::warn;
+use style_traits::ToCss;
 
 use super::{SubtestResult, parse_and_resolve_document};
 use crate::{SubtestCounts, TestStatus, ThreadCtx};
@@ -16,14 +18,15 @@ pub fn process_attr_test(
     subtest_selector: &str,
     html: &str,
     relative_path: &str,
-) -> (SubtestCounts, Vec<SubtestResult>) {
+) -> (TestStatus, SubtestCounts, Vec<SubtestResult>) {
     let mut document = parse_and_resolve_document(ctx, html, relative_path);
 
     let Ok(subtest_roots) = document.query_selector_all(subtest_selector) else {
         panic!("Err parsing subtest selector \"{subtest_selector}\"");
     };
     if subtest_roots.is_empty() {
-        panic!("No matching nodes found for subtest selector \"{subtest_selector}\"");
+        warn!("No matching nodes found for subtest selector \"{subtest_selector}\"");
+        return (TestStatus::Fail, SubtestCounts::ZERO_OF_ZERO, Vec::new());
     }
 
     let subtest_count = subtest_roots.len() as u32;
@@ -61,16 +64,22 @@ pub fn process_attr_test(
         total: subtest_count,
     };
 
-    (subtest_counts, subtest_results)
+    let status = subtest_counts.as_status();
+    (status, subtest_counts, subtest_results)
 }
 
 pub fn check_node_layout(node: &Node) -> Vec<String> {
-    let layout = &node.final_layout;
-    let parent_border = if let Some(parent_id) = node.parent {
-        node.with(parent_id).final_layout.border
-    } else {
-        taffy::Rect::ZERO
-    };
+    if node.element_data().is_none() {
+        return Vec::new();
+    }
+    let layout = node.final_layout();
+
+    let client_width =
+        layout.size.width - layout.border.left - layout.border.right - layout.scrollbar_size.width;
+    let client_height = layout.size.height
+        - layout.border.top
+        - layout.border.bottom
+        - layout.scrollbar_size.height;
 
     node.attrs()
         .map(|attrs| {
@@ -101,37 +110,42 @@ pub fn check_node_layout(node: &Node) -> Vec<String> {
                             check_attr(name, value, layout.margin.right)
                         }
 
-                        // TODO: Implement proper offset-x/offset-y computation
-                        // (don't assume that offset is relative to immediate parent)
-                        "data-offset-x" => {
-                            check_attr(name, value, layout.location.x - parent_border.left)
-                        }
-                        "data-offset-y" => {
-                            check_attr(name, value, layout.location.y - parent_border.top)
-                        }
+                        "data-offset-x" => check_attr(name, value, node.offset_top_left().x),
+                        "data-offset-y" => check_attr(name, value, node.offset_top_left().y),
 
-                        // TODO: other check types
-                        "data-expected-client-width" => {
-                            Err(format!("Unsupported assertion: {name}"))
-                        }
-                        "data-expected-client-height" => {
-                            Err(format!("Unsupported assertion: {name}"))
-                        }
-                        "data-expected-scroll-width" => {
-                            Err(format!("Unsupported assertion: {name}"))
-                        }
-                        "data-expected-scroll-height" => {
-                            Err(format!("Unsupported assertion: {name}"))
-                        }
+                        "data-expected-client-width" => check_attr(name, value, client_width),
+                        "data-expected-client-height" => check_attr(name, value, client_height),
+                        "data-expected-scroll-width" => check_attr(
+                            name,
+                            value,
+                            client_width.max(layout.scrollable_overflow_rect.right),
+                        ),
+                        "data-expected-scroll-height" => check_attr(
+                            name,
+                            value,
+                            client_height.max(layout.scrollable_overflow_rect.bottom),
+                        ),
                         "data-expected-bounding-client-rect-width" => {
-                            Err(format!("Unsupported assertion: {name}"))
+                            check_attr(name, value, layout.size.width)
                         }
                         "data-expected-bounding-client-rect-height" => {
-                            Err(format!("Unsupported assertion: {name}"))
+                            check_attr(name, value, layout.size.height)
                         }
-                        "data-total-x" => Err(format!("Unsupported assertion: {name}")),
-                        "data-total-y" => Err(format!("Unsupported assertion: {name}")),
-                        "data-expected-display" => Err(format!("Unsupported assertion: {name}")),
+                        "data-total-x" => check_attr(name, value, total_offset(node).0),
+                        "data-total-y" => check_attr(name, value, total_offset(node).1),
+                        "data-expected-display" => {
+                            let display = node
+                                .primary_styles()
+                                .map(|styles| styles.clone_display().to_css_string())
+                                .unwrap_or_default();
+                            if display == **value {
+                                Ok(())
+                            } else {
+                                Err(format!(
+                                    "assert_equals: {name} expected {value} got {display}"
+                                ))
+                            }
+                        }
 
                         // Not a check attribute
                         _ => Ok(()),
@@ -143,10 +157,28 @@ pub fn check_node_layout(node: &Node) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn total_offset(node: &Node) -> (f32, f32) {
+    let mut x = 0.0;
+    let mut y = 0.0;
+    let mut current = node;
+    loop {
+        let layout = current.final_layout();
+        x += layout.location.x;
+        y += layout.location.y;
+        match current.layout_parent.get() {
+            Some(parent_id) => current = current.with(parent_id),
+            None => break,
+        }
+    }
+    (x, y)
+}
+
 fn check_attr(attr_name: &str, attr_val: &str, actual: f32) -> Result<(), String> {
-    let expected: f32 = attr_val
-        .parse()
-        .expect("Failed to parse check attribute as f32");
+    let Ok(expected) = attr_val.parse::<f32>() else {
+        return Err(format!(
+            "assert_equals: failed to parse {attr_name} value {attr_val} as f32"
+        ));
+    };
 
     let equal = assert_with_tolerance(expected, actual);
 

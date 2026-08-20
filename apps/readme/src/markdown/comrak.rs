@@ -1,34 +1,34 @@
 //! Render the readme.md using the gpu renderer
 
-use comrak::{ExtensionOptions, Options, Plugins, RenderOptions, markdown_to_html_with_plugins};
+use comrak::{Options, markdown_to_html_with_plugins, options};
 
 pub(crate) fn markdown_to_html(contents: String) -> String {
-    let plugins = Plugins::default();
+    let plugins = options::Plugins::default();
     // let syntax_highligher = CustomSyntectAdapter(SyntectAdapter::new(Some("InspiredGitHub")));
     // plugins.render.codefence_syntax_highlighter = Some(&syntax_highligher as _);
 
     let body_html = markdown_to_html_with_plugins(
         &contents,
         &Options {
-            extension: ExtensionOptions {
+            extension: options::Extension {
                 strikethrough: true,
                 tagfilter: false,
                 table: true,
                 autolink: true,
                 tasklist: true,
                 superscript: false,
-                header_ids: None,
+                header_id_prefix: None,
                 footnotes: false,
                 description_lists: false,
                 front_matter_delimiter: None,
                 multiline_block_quotes: false,
                 alerts: true,
-                ..ExtensionOptions::default()
+                ..options::Extension::default()
             },
-            render: RenderOptions {
-                unsafe_: true,
+            render: options::Render {
+                r#unsafe: true,
                 tasklist_classes: true,
-                ..RenderOptions::default()
+                ..options::Render::default()
             },
             ..Options::default()
         },
