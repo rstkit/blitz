@@ -3,29 +3,59 @@ use kurbo::{BezPath, Circle, Ellipse, Point, Rect, Shape, SvgArc, Vec2};
 use style::values::computed::basic_shape::{BasicShape, ClipPath};
 use style::values::computed::{Angle, CSSPixelLength, LengthPercentage};
 use style::values::generics::basic_shape::{
-    ArcSize, ArcSweep, AxisEndPoint, AxisPosition, CommandEndPoint, ControlPoint, ControlReference,
+    ArcSize, ArcSweep, AxisEndPoint, CommandEndPoint, ControlPoint, ControlReference,
     GenericBasicShape, GenericPathOrShapeFunction, GenericShapeCommand, GenericShapeRadius,
     ShapeBox, ShapeGeometryBox,
 };
 use style::values::generics::position::{GenericPosition, GenericPositionOrAuto};
 
 impl ElementCx<'_, '_> {
+    /// Compute the rectangle (in scaled pixels, relative to the border box origin) described by
+    /// the CSS 2 `clip` property, if it applies. `clip` only applies to absolutely positioned
+    /// elements; `auto` components resolve to the corresponding border box edge.
+    pub(super) fn css_clip_rect(&self) -> Option<Rect> {
+        use style::computed_values::position::T as Position;
+        use style::values::computed::LengthOrAuto;
+        use style::values::generics::ClipRectOrAuto;
+
+        if !matches!(
+            self.style.get_box().position,
+            Position::Absolute | Position::Fixed
+        ) {
+            return None;
+        }
+        let ClipRectOrAuto::Rect(rect) = &self.style.get_effects().clip else {
+            return None;
+        };
+
+        let border_box = self.frame.border_box;
+        let resolve = |component: &LengthOrAuto, auto: f64| match component {
+            LengthOrAuto::Auto => auto,
+            LengthOrAuto::LengthPercentage(length) => length.px() as f64 * self.scale,
+        };
+        let x0 = resolve(&rect.left, 0.0);
+        let y0 = resolve(&rect.top, 0.0);
+        let x1 = resolve(&rect.right, border_box.width());
+        let y1 = resolve(&rect.bottom, border_box.height());
+
+        Some(Rect::new(x0, y0, x1.max(x0), y1.max(y0)))
+    }
+
     /// Compute the clip-path BezPath (if any) for this element.
     /// Returns `None` if clip-path is `none` or unsupported.
     pub(super) fn clip_path_shape(&self) -> Option<BezPath> {
-        let clip_path = self.style.clone_clip_path();
-        match clip_path {
+        match self.style.get_clip_path() {
             ClipPath::None => None,
             ClipPath::Url(_) => {
                 // URL references (e.g. `clip-path: url(#myClip)`) are not yet supported
                 None
             }
             ClipPath::Shape(basic_shape, geometry_box) => {
-                let reference_box = self.resolve_geometry_box(&geometry_box);
-                self.basic_shape_to_path(&basic_shape, reference_box)
+                let reference_box = self.resolve_geometry_box(geometry_box);
+                self.basic_shape_to_path(basic_shape, reference_box)
             }
             ClipPath::Box(geometry_box) => {
-                let reference_box = self.resolve_geometry_box(&geometry_box);
+                let reference_box = self.resolve_geometry_box(geometry_box);
                 Some(Rect::from(reference_box).into_path(0.1))
             }
         }
@@ -139,8 +169,6 @@ impl ElementCx<'_, '_> {
             GenericBasicShape::PathOrShape(path_or_shape) => match path_or_shape {
                 GenericPathOrShapeFunction::Path(path) => svg_path_to_bezpath(
                     path.commands(),
-                    w,
-                    h,
                     |v| *v as f64,
                     |v| *v as f64,
                     |v| *v as f64,
@@ -151,8 +179,6 @@ impl ElementCx<'_, '_> {
                 }),
                 GenericPathOrShapeFunction::Shape(shape) => svg_path_to_bezpath(
                     &shape.commands,
-                    w,
-                    h,
                     move |v: &LengthPercentage| {
                         v.resolve(CSSPixelLength::new(w as f32)).px() as f64
                     },
@@ -251,15 +277,13 @@ fn resolve_shape_radius(
     }
 }
 
-type GenericPathCommand<Angle, N> = GenericShapeCommand<Angle, GenericPosition<N, N>, N>;
+type GenericPathCommand<Angle, N> = GenericShapeCommand<Angle, N, GenericPosition<N, N>, N>;
 
 /// Convert an SVG path() to a kurbo BezPath.
 /// The returned path is in the path's own coordinate system (origin at 0,0).
 /// The caller is responsible for translating it to the reference box origin.
 fn svg_path_to_bezpath<Angle: Copy, N>(
     commands: &[GenericPathCommand<Angle, N>],
-    w: f64,
-    h: f64,
     resolve_x: impl Fn(&N) -> f64,
     resolve_y: impl Fn(&N) -> f64,
     resolve_angle: impl Fn(&Angle) -> f64,
@@ -295,12 +319,12 @@ fn svg_path_to_bezpath<Angle: Copy, N>(
                 last_control = None;
             }
             GenericShapeCommand::HLine { x } => {
-                cur.x = resolve_axis_endpoint(x, cur.x, w, &resolve_x);
+                cur.x = resolve_axis_endpoint(x, cur.x, &resolve_x);
                 bez.line_to(cur);
                 last_control = None;
             }
             GenericShapeCommand::VLine { y } => {
-                cur.y = resolve_axis_endpoint(y, cur.y, h, &resolve_y);
+                cur.y = resolve_axis_endpoint(y, cur.y, &resolve_y);
                 bez.line_to(cur);
                 last_control = None;
             }
@@ -439,23 +463,13 @@ fn reflect_point(last_control: Option<Point>, cur: Point) -> Point {
 
 /// Resolve an AxisEndPoint to an absolute value.
 /// `ToPosition` is absolute; `ByCoordinate` is relative to `cur_val`.
-/// `w` and `h` are the reference box dimensions so keywords resolve against the correct axis.
 fn resolve_axis_endpoint<N>(
-    endpoint: &AxisEndPoint<N>,
+    endpoint: &AxisEndPoint<N, N>,
     cur_val: f64,
-    basis: f64,
     resolve: impl Fn(&N) -> f64,
 ) -> f64 {
-    use style::values::generics::basic_shape::AxisPositionKeyword;
     match endpoint {
-        AxisEndPoint::ToPosition(AxisPosition::LengthPercent(lp)) => resolve(lp),
-        AxisEndPoint::ToPosition(AxisPosition::Keyword(kw)) => match kw {
-            AxisPositionKeyword::Left | AxisPositionKeyword::XStart => 0.0,
-            AxisPositionKeyword::Right | AxisPositionKeyword::XEnd => basis,
-            AxisPositionKeyword::Top | AxisPositionKeyword::YStart => 0.0,
-            AxisPositionKeyword::Bottom | AxisPositionKeyword::YEnd => basis,
-            AxisPositionKeyword::Center => basis / 2.0,
-        },
+        AxisEndPoint::ToPosition(pos) => resolve(pos),
         AxisEndPoint::ByCoordinate(val) => cur_val + resolve(val),
     }
 }

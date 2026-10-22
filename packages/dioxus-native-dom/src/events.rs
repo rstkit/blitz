@@ -24,7 +24,7 @@ use dioxus_html::{
         InteractionElementOffset, InteractionLocation, ModifiersInteraction, PointerInteraction,
     },
 };
-use keyboard_types::{Code, Key, Location, Modifiers};
+use dioxus_html::{Code, Key, Location, Modifiers};
 use std::{
     any::Any,
     cell::{Ref, RefCell, RefMut},
@@ -35,6 +35,7 @@ use std::{
 };
 
 use crate::NodeId;
+use crate::keyboard_compat::{convert_code, convert_key, convert_location, convert_modifiers};
 
 pub struct NativeConverter {}
 
@@ -197,12 +198,22 @@ impl RenderedElementBacking for NodeHandle {
     }
 
     fn get_scroll_offset(&self) -> Pin<Box<dyn Future<Output = MountedResult<PixelsVector2D>>>> {
-        let scroll_offset = *self.node().scroll_offset();
+        let Some(scroll_offset) = self
+            .doc()
+            .get_node(self.node_id)
+            .map(|node| *node.scroll_offset())
+        else {
+            return self.node_not_exist_err();
+        };
         Box::pin(async move { Ok(PixelsVector2D::new(scroll_offset.x, scroll_offset.y)) })
     }
 
     fn get_scroll_size(&self) -> Pin<Box<dyn Future<Output = MountedResult<PixelsSize>>>> {
-        let node = self.node();
+        let doc = self.doc();
+        let Some(node) = doc.get_node(self.node_id) else {
+            drop(doc);
+            return self.node_not_exist_err();
+        };
         let scroll_width = node.final_layout().scroll_width() as f64;
         let scroll_height = node.final_layout().scroll_height() as f64;
         Box::pin(async move { Ok(PixelsSize::new(scroll_width, scroll_height)) })
@@ -330,21 +341,21 @@ pub(crate) struct BlitzKeyboardData(pub(crate) BlitzKeyEvent);
 
 impl ModifiersInteraction for BlitzKeyboardData {
     fn modifiers(&self) -> Modifiers {
-        self.0.modifiers
+        convert_modifiers(self.0.modifiers)
     }
 }
 
 impl HasKeyboardData for BlitzKeyboardData {
     fn key(&self) -> Key {
-        self.0.key.clone()
+        convert_key(&self.0.key)
     }
 
     fn code(&self) -> Code {
-        self.0.code
+        convert_code(self.0.code)
     }
 
     fn location(&self) -> Location {
-        self.0.location
+        convert_location(self.0.location)
     }
 
     fn is_auto_repeating(&self) -> bool {
@@ -385,7 +396,7 @@ impl InteractionElementOffset for NativePointerData {
 
 impl ModifiersInteraction for NativePointerData {
     fn modifiers(&self) -> Modifiers {
-        self.0.mods
+        convert_modifiers(self.0.mods)
     }
 }
 
@@ -471,7 +482,7 @@ pub struct NativeTouchData(pub(crate) BlitzPointerEvent);
 
 impl ModifiersInteraction for NativeTouchData {
     fn modifiers(&self) -> Modifiers {
-        self.0.mods
+        convert_modifiers(self.0.mods)
     }
 }
 
@@ -623,7 +634,7 @@ impl PointerInteraction for NativeWheelData {
 
 impl ModifiersInteraction for NativeWheelData {
     fn modifiers(&self) -> Modifiers {
-        self.0.mods
+        convert_modifiers(self.0.mods)
     }
 }
 
@@ -647,10 +658,20 @@ impl InteractionLocation for NativeWheelData {
     }
 }
 
-pub fn synthetic_click_event(node: &Node, modifiers: Modifiers) -> Box<dyn Any> {
+pub fn synthetic_click_event(node: &Node, modifiers: keyboard_types::Modifiers) -> Box<dyn Any> {
     Box::new(NativePointerData(
         node.synthetic_click_event_data(modifiers),
     ))
+}
+
+pub fn synthetic_form_event(
+    value: impl Into<String>,
+    values: impl Into<Vec<(String, FormValue)>>,
+) -> Box<dyn Any> {
+    Box::new(NativeFormData {
+        value: value.into(),
+        values: values.into(),
+    })
 }
 
 #[cfg(test)]
