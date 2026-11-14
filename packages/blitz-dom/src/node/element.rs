@@ -6,8 +6,10 @@ use markup5ever::{LocalName, QualName, local_name};
 use selectors::matching::{ElementSelectorFlags, QuirksMode};
 use std::cell::Cell;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
+
+use crate::stylo::PresentationalHints;
 use style::Atom;
 use style::parser::ParserContext;
 use style::properties::{Importance, PropertyDeclaration, PropertyId, SourcePropertyDeclaration};
@@ -68,6 +70,10 @@ pub struct ElementData {
     /// The element's parsed style attribute (used by stylo)
     pub style_attribute: Option<ServoArc<Locked<PropertyDeclarationBlock>>>,
 
+    /// The declaration blocks of the element's presentational hints, built from its
+    /// attributes when style matching first asks for them. Cleared when an attribute changes.
+    pub(crate) presentational_hints: OnceLock<PresentationalHints>,
+
     /// Heterogeneous data that depends on the element's type.
     /// For example:
     ///   - The image data for \<img\> elements.
@@ -110,6 +116,10 @@ pub struct ElementData {
     /// Whether this node or any of its descendants may carry `RestyleDamage`.
     /// Used by the damage propagation pass to skip unchanged subtrees.
     pub damaged_descendants: AtomicBool,
+    /// Whether an animation or transition set has ever been stored for this
+    /// element (or its pseudo-elements). Lets Stylo skip the animation lookups
+    /// for elements that have never animated.
+    pub may_have_animations: AtomicBool,
 
     // Pseudo element nodes
     pub before: Option<NodeId>,
@@ -322,6 +332,7 @@ impl Clone for ElementData {
             template_contents: self.template_contents,
 
             // Runtime state: reset to defaults.
+            presentational_hints: OnceLock::new(),
             stylo_element_data: Default::default(),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
             guard: self.guard.clone(),
@@ -330,6 +341,7 @@ impl Clone for ElementData {
             snapshot_handled: AtomicBool::new(false),
             dirty_descendants: AtomicBool::new(true),
             damaged_descendants: AtomicBool::new(true),
+            may_have_animations: AtomicBool::new(false),
             before: None,
             after: None,
             detailed_layout_info: taffy::DetailedLayoutInfo::None,
@@ -428,6 +440,7 @@ impl ElementData {
             attrs: Attributes::new(attrs),
             is_focussable: false,
             style_attribute: Default::default(),
+            presentational_hints: OnceLock::new(),
             inline_layout_data: None,
             list_item_data: None,
             special_data: SpecialElementData::None,
@@ -443,6 +456,7 @@ impl ElementData {
             snapshot_handled: AtomicBool::new(false),
             dirty_descendants: AtomicBool::new(true),
             damaged_descendants: AtomicBool::new(true),
+            may_have_animations: AtomicBool::new(false),
             before: None,
             after: None,
             detailed_layout_info: taffy::DetailedLayoutInfo::None,
@@ -473,6 +487,8 @@ impl ElementData {
                     false => ElementState::ENABLED,
                 });
         }
+
+        data.flush_open_state();
 
         data
     }
@@ -519,6 +535,14 @@ impl ElementData {
         if self.is_link() {
             self.element_state.insert(ElementState::UNVISITED);
         }
+    }
+
+    pub fn flush_open_state(&mut self) {
+        let is_open = matches!(
+            self.name.local,
+            local_name!("details") | local_name!("dialog")
+        ) && self.has_attr(local_name!("open"));
+        self.element_state.set(ElementState::OPEN, is_open);
     }
 
     pub fn image_data(&self) -> Option<&ImageData> {
@@ -808,8 +832,11 @@ impl ElementData {
     }
 
     #[cfg(feature = "custom-widget")]
-    pub fn set_custom_widget(&mut self, widget: Box<dyn crate::Widget>) {
+    pub fn set_custom_widget(&mut self, mut widget: Box<dyn crate::Widget>) {
         use crate::node::custom_widget::CustomWidgetData;
+        for attr in self.attrs.iter() {
+            widget.attribute_changed(&attr.name.local, None, Some(&attr.value));
+        }
         self.special_data = SpecialElementData::CustomWidget(CustomWidgetData::new(widget));
     }
 
@@ -935,6 +962,10 @@ impl std::fmt::Debug for SpecialElementData {
 pub struct ListItemLayout {
     pub marker: Marker,
     pub position: ListItemLayoutPosition,
+    /// Offset (in physical CSS px) of the unrounded content box origin from the rounded one in
+    /// `final_layout`. Paint draws text from the unrounded origin so that it keeps its sub-pixel
+    /// position while box edges stay snapped. Set by the `writing-mode` layout pass; zero otherwise.
+    pub content_box_subpixel_offset: taffy::Point<f32>,
 }
 
 //We seperate chars from strings in order to optimise rendering - ie not needing to

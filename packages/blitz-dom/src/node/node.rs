@@ -17,10 +17,11 @@ use std::fmt::Write;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "writing-mode")]
 use style::computed_values::flex_direction::T as FlexDirection;
 use style::computed_values::isolation::T as Isolation;
+use style::computed_values::overflow_x::T as Overflow;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
+use style::dom::OpaqueNode;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::ComputedValues;
 use style::properties::generated::longhands::position::computed_value::T as Position;
@@ -36,6 +37,7 @@ use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style_dom::ElementState;
 use style_traits::values::ToCss;
 use stylo_taffy::CopyStyleGetters;
+use stylo_taffy::WritingModeExt;
 use taffy::{Cache, prelude::Layout};
 use thin_vec::ThinVec;
 
@@ -58,6 +60,8 @@ bitflags! {
         const IS_TABLE_ROOT = 0b00000010;
         /// Whether the node is "in the document" (~= has a parent and isn't a template node)
         const IS_IN_DOCUMENT = 0b00000100;
+        /// Whether the node is an inline box whose in-flow content is block-level only
+        const IS_INLINE_WITH_ONLY_BLOCK_CHILDREN = 0b00001000;
     }
 }
 
@@ -81,6 +85,7 @@ impl NodeFlags {
     pub fn reset_construction_flags(&mut self) {
         self.remove(Self::IS_INLINE_ROOT);
         self.remove(Self::IS_TABLE_ROOT);
+        self.remove(Self::IS_INLINE_WITH_ONLY_BLOCK_CHILDREN);
     }
 }
 
@@ -210,6 +215,17 @@ impl Node {
             NodeData::Element(data) | NodeData::AnonymousBlock(data) => data.layout_data_mut(),
             NodeData::Document(data) => data.layout_data_mut(),
             _ => panic!("`layout_data` is not available on this node kind"),
+        }
+    }
+
+    /// This node's layout output state, if it has been allocated. Returns
+    /// `None` for node kinds which do not participate in layout.
+    #[inline]
+    pub fn try_layout_data(&self) -> Option<&LayoutData> {
+        match &self.data {
+            NodeData::Element(data) | NodeData::AnonymousBlock(data) => data.layout_data.as_deref(),
+            NodeData::Document(data) => data.layout_data.as_deref(),
+            _ => None,
         }
     }
 
@@ -524,6 +540,14 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Whether box-tree construction found this to be an inline box with block-level in-flow content only.
+    /// It is laid out as a block box, so its own background and borders must not be painted
+    /// over that content. Inline text or inline children keep the painting.
+    pub fn is_inline_with_only_block_children(&self) -> bool {
+        self.flags
+            .contains(NodeFlags::IS_INLINE_WITH_ONLY_BLOCK_CHILDREN)
     }
 
     pub fn is_whitespace_node(&self) -> bool {
@@ -996,6 +1020,34 @@ impl Node {
         self.tree().get(id).unwrap()
     }
 
+    /// The node's DOM parent.
+    pub fn parent_node(&self) -> Option<&Node> {
+        self.parent.map(|id| self.with(id))
+    }
+
+    /// The node's first DOM child that is an element.
+    pub fn first_element_child(&self) -> Option<&Node> {
+        self.children
+            .iter()
+            .map(|id| self.with(*id))
+            .find(|child| child.is_element())
+    }
+
+    /// The root of the tree containing the node: the document node, for a node in the document.
+    pub fn owner_doc(&self) -> &Node {
+        // Walk up the (layout-)parent chain to the root Document node.
+        let mut node = self;
+        while let Some(parent) = node.parent_node() {
+            node = parent;
+        }
+        node
+    }
+
+    /// The node's identity in Stylo (the key of its snapshot).
+    pub(crate) fn opaque(&self) -> OpaqueNode {
+        OpaqueNode(self.id.as_u64() as usize)
+    }
+
     pub fn print_tree(&self, level: usize) {
         println!(
             "{} {} {:?} {} {:?}",
@@ -1355,7 +1407,9 @@ impl Node {
             return true;
         }
 
-        // TODO: mix-blend-mode
+        if style.get_effects().mix_blend_mode != style::computed_values::mix_blend_mode::T::Normal {
+            return true;
+        }
         // TODO: contain
 
         false
@@ -1397,6 +1451,10 @@ impl Node {
     ///    - Some(HitResult) if the position is within the node but doesn't match any children
     ///    - The result of recursively calling child.hit() on the the child element that is
     ///      positioned at that position if there is one.
+    ///
+    /// Hit testing may run between a DOM mutation and the next `resolve`, so the
+    /// paint lists and inline layouts it walks can still name nodes the mutation
+    /// dropped; those are skipped.
     ///
     /// TODO: z-index
     /// (If multiple children are positioned at the position then a random one will be recursed into)
@@ -1444,16 +1502,44 @@ impl Node {
         }
 
         let size = self.final_layout().size;
-        let matches_self = !(x < 0.0
+        let matches_self = !(x < self.scroll_offset().x as f32
             || x > size.width + self.scroll_offset().x as f32
-            || y < 0.0
+            || y < self.scroll_offset().y as f32
             || y > size.height + self.scroll_offset().y as f32);
 
-        let overflow_rect = self.final_layout().scrollable_overflow_rect;
-        let matches_content = !(x < 0.0
-            || x > overflow_rect.right + self.scroll_offset().x as f32
-            || y < 0.0
-            || y > overflow_rect.bottom + self.scroll_offset().y as f32);
+        let layout = self.final_layout();
+        let overflow_rect = layout.scrollable_overflow_rect;
+        // Not `layout_style()`: hit testing also reaches elements that have no computed styles
+        // yet (a pointer event before the first resolve). Those count as left-to-right.
+        let is_rtl = self.primary_styles().is_some_and(|style| {
+            style.clone_direction() == style::computed_values::direction::T::Rtl
+        });
+        let (gutter_left, gutter_top) = (is_rtl, false);
+        #[cfg(feature = "writing-mode")]
+        let (gutter_left, gutter_top) = {
+            let wm = self.layout_data().writing_mode;
+            if wm.swaps_axes() {
+                (wm.block_left_is_end(), wm.direction().is_rtl())
+            } else {
+                (gutter_left, gutter_top)
+            }
+        };
+        let client_x = layout.border.left
+            + if gutter_left {
+                layout.scrollbar_size.width
+            } else {
+                0.0
+            };
+        let client_y = layout.border.top
+            + if gutter_top {
+                layout.scrollbar_size.height
+            } else {
+                0.0
+            };
+        let matches_content = !(x < overflow_rect.left() + client_x
+            || x > overflow_rect.right() + client_x
+            || y < overflow_rect.top() + client_y
+            || y > overflow_rect.bottom() + client_y);
 
         let matches_hoisted_content = match &self.stacking_context {
             Some(sc) => {
@@ -1489,26 +1575,32 @@ impl Node {
             *scrollbar = Some(sb);
         }
 
-        let content_box_offset = taffy::Point {
-            x: self.final_layout().padding.left + self.final_layout().border.left,
-            y: self.final_layout().padding.top + self.final_layout().border.top,
+        // Text clusters and callers of the returned coordinates work in the
+        // inline root's content box, but embedded boxes store border-box
+        // relative locations like every other child; apply the offset only
+        // where content-box coordinates are wanted, or atomic inlines in a
+        // padded inline root are hit one padding down and right of where
+        // they are painted.
+        let content_box_offset = if self.flags.is_inline_root() {
+            taffy::Point {
+                x: self.final_layout().padding.left + self.final_layout().border.left,
+                y: self.final_layout().padding.top + self.final_layout().border.top,
+            }
+        } else {
+            taffy::Point { x: 0.0, y: 0.0 }
         };
-        if self.flags.is_inline_root() {
-            x -= content_box_offset.x;
-            y -= content_box_offset.y;
-        }
 
         // Positive z_index hoisted children
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
+                    let Some(child) = self.tree().get(hoisted_child.node_id) else {
+                        continue;
+                    };
                     let pos = hoisted_child.position(self.tree(), self.id);
                     let x = x - pos.x;
                     let y = y - pos.y;
-                    if let Some(hit) = self
-                        .with(hoisted_child.node_id)
-                        .hit_inner(x, y, scale, scrollbar)
-                    {
+                    if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
                         return Some(hit);
                     }
                 }
@@ -1517,17 +1609,13 @@ impl Node {
 
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
-            let child = self.with(*child_id);
+            let Some(child) = self.tree().get(*child_id) else {
+                continue;
+            };
             let child_position = child.taffy_position();
             let mut child_x = x;
             let mut child_y = y;
             if child_position.is_out_of_flow() {
-                // Out-of-flow children's layout location is relative to this node's
-                // border box, so undo the inline-root content-box offset applied above
-                if self.flags.is_inline_root() {
-                    child_x += content_box_offset.x;
-                    child_y += content_box_offset.y;
-                }
                 // Fixed-position children of the root element are positioned
                 // against the viewport and do not scroll with it. (A fixed box
                 // whose containing block is a transformed ancestor scrolls with
@@ -1539,6 +1627,9 @@ impl Node {
                     child_x -= viewport_scroll.x as f32;
                     child_y -= viewport_scroll.y as f32;
                 }
+            } else if let Some(offset) = child.lifted_paint_offset(self.id) {
+                child_x -= offset.x;
+                child_y -= offset.y;
             }
             if let Some(hit) = child.hit_inner(child_x, child_y, scale, scrollbar) {
                 return Some(hit);
@@ -1549,36 +1640,49 @@ impl Node {
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
                 for hoisted_child in hoisted.neg_z_hoisted_children().rev() {
+                    let Some(child) = self.tree().get(hoisted_child.node_id) else {
+                        continue;
+                    };
                     let pos = hoisted_child.position(self.tree(), self.id);
                     let x = x - pos.x;
                     let y = y - pos.y;
-                    if let Some(hit) = self
-                        .with(hoisted_child.node_id)
-                        .hit_inner(x, y, scale, scrollbar)
-                    {
+                    if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
                         return Some(hit);
                     }
                 }
             }
         }
 
+        // Line boxes are clipped to the padding box on axes where overflow is not visible.
+        let clips_point = self.primary_styles().is_some_and(|style| {
+            let x = x - self.scroll_offset().x as f32;
+            let y = y - self.scroll_offset().y as f32;
+            (style.clone_overflow_x() != Overflow::Visible
+                && (x < layout.border.left || x > size.width - layout.border.right))
+                || (style.clone_overflow_y() != Overflow::Visible
+                    && (y < layout.border.top || y > size.height - layout.border.bottom))
+        });
+
         // Inline children
         if self.flags.is_inline_root() {
+            let x = x - content_box_offset.x;
+            let y = y - content_box_offset.y;
             let element_data = &self.element_data().unwrap();
             if let Some(ild) = element_data.inline_layout_data.as_ref() {
                 let layout = &ild.layout;
                 let scale = layout.scale();
                 let y = y - ild.block_offset;
 
-                if let Some((cluster, _side)) =
-                    Cluster::from_point_exact(layout, x * scale, y * scale)
+                if !clips_point
+                    && let Some((cluster, _side)) =
+                        Cluster::from_point_exact(layout, x * scale, y * scale)
                 {
                     let node_id = cluster.style().brush.id;
-                    let text_pointer_events_none = self
-                        .with(node_id)
-                        .primary_styles()
-                        .is_some_and(|style| style.clone_pointer_events() == PointerEvents::None);
-                    if !text_pointer_events_none {
+                    if let Some(text_node) = self.tree().get(node_id)
+                        && !text_node.primary_styles().is_some_and(|style| {
+                            style.clone_pointer_events() == PointerEvents::None
+                        })
+                    {
                         return Some(HitResult {
                             node_id,
                             x,
@@ -1594,8 +1698,8 @@ impl Node {
         if matches_self && !pointer_events_none {
             return Some(HitResult {
                 node_id: self.id,
-                x,
-                y,
+                x: x - content_box_offset.x,
+                y: y - content_box_offset.y,
                 is_text: false,
             });
         }
@@ -1899,15 +2003,94 @@ impl Node {
     /// CSSOM View's `scrollWidth`: the width of the node's content, including
     /// content not visible due to overflow
     pub fn scroll_width(&self) -> f32 {
-        self.client_width()
-            .max(self.final_layout().scrollable_overflow_rect.right)
+        self.cssom_scroll_size().width
     }
 
     /// CSSOM View's `scrollHeight`: the height of the node's content, including
     /// content not visible due to overflow
     pub fn scroll_height(&self) -> f32 {
-        self.client_height()
-            .max(self.final_layout().scrollable_overflow_rect.bottom)
+        self.cssom_scroll_size().height
+    }
+
+    fn cssom_scroll_size(&self) -> taffy::Size<f32> {
+        let layout = self.final_layout();
+        if self.primary_styles().is_none() {
+            return taffy::Size {
+                width: self.client_width() + layout.scroll_width(),
+                height: self.client_height() + layout.scroll_height(),
+            };
+        }
+        let overflow = taffy::CoreStyle::overflow(&self.layout_style());
+        if overflow.x.is_scroll_container() || overflow.y.is_scroll_container() {
+            return taffy::Size {
+                width: self.client_width() + layout.scroll_width(),
+                height: self.client_height() + layout.scroll_height(),
+            };
+        }
+
+        // Non-scroll containers retain both sides for propagation and hit testing, but do not
+        // carry scroll-origin flags. CSSOM still measures their scrolling area from its origin.
+        let mut inline = false;
+        let mut block = false;
+        let mut vertical = false;
+        if let Some(style) = self.primary_styles() {
+            let wm = style.writing_mode;
+            inline = wm.direction().is_rtl();
+            block = wm.block_left_is_end();
+            vertical = wm.swaps_axes();
+            if self.taffy_display() == taffy::Display::Flex {
+                let position = style.get_position();
+                let row = matches!(
+                    position.flex_direction,
+                    FlexDirection::Row | FlexDirection::RowReverse
+                );
+                let reverse = matches!(
+                    position.flex_direction,
+                    FlexDirection::RowReverse | FlexDirection::ColumnReverse
+                );
+                let wrap_reverse = position
+                    .flex_wrap
+                    .contains(style::values::computed::FlexWrap::WRAP_REVERSE);
+                inline ^= if row { reverse } else { wrap_reverse };
+                block ^= if row { wrap_reverse } else { reverse };
+            }
+        }
+        let (reverse_x, reverse_y) = if vertical {
+            (block, inline)
+        } else {
+            (inline, block)
+        };
+        let overflow = layout.scrollable_overflow_rect;
+        taffy::Size {
+            width: if reverse_x {
+                self.client_width() - overflow.left()
+            } else {
+                self.client_width().max(overflow.right())
+            },
+            height: if reverse_y {
+                self.client_height() - overflow.top()
+            } else {
+                self.client_height().max(overflow.bottom())
+            },
+        }
+    }
+
+    /// Signed CSSOM scroll offsets, with zero at the initial scroll position.
+    pub(crate) fn scroll_range(&self) -> (crate::Point<f64>, crate::Point<f64>) {
+        let layout = self.final_layout();
+        let reversed = layout.scrollable_overflow_rect.is_reversed();
+        let width = layout.scroll_width() as f64;
+        let height = layout.scroll_height() as f64;
+        (
+            crate::Point {
+                x: if reversed.x { -width } else { 0.0 },
+                y: if reversed.y { -height } else { 0.0 },
+            },
+            crate::Point {
+                x: if reversed.x { 0.0 } else { width },
+                y: if reversed.y { 0.0 } else { height },
+            },
+        )
     }
 
     /// Does the node generate any boxes? (e.g. `getClientRects()` returns an empty

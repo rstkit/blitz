@@ -3,6 +3,7 @@
 
 #![allow(clippy::collapsible_if)]
 
+mod blend;
 mod color;
 mod debug_overlay;
 mod filters;
@@ -12,6 +13,7 @@ mod layers;
 mod render;
 mod sizing;
 mod text;
+mod text_decorations;
 
 use std::collections::HashMap;
 
